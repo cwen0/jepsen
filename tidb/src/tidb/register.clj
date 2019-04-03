@@ -17,7 +17,7 @@
 (defn w   [_ _] {:type :invoke, :f :write, :value (rand-int 5)})
 (defn cas [_ _] {:type :invoke, :f :cas, :value [(rand-int 5) (rand-int 5)]})
 
-(defrecord AtomicClient [node]
+(defrecord RegisterClient [node]
   client/Client
 
   (setup! [this test node]
@@ -56,7 +56,7 @@
   (basic/basic-test
     (merge
       {:name        "register"
-       :client      {:client (AtomicClient. nil)
+       :client      {:client (RegisterClient. nil)
                      :during (independent/concurrent-generator
                                10
                                (range)
