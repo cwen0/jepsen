@@ -6,6 +6,7 @@
             [clojure.java.io :as io]
             [clojure.tools.logging :refer :all]
             [clojure.pprint :refer [pprint]]
+            [clj-time.format :as timef]
             [hiccup.core :as h]
             [ring.util.response :as response]
             [org.httpkit.server :as server])
@@ -53,7 +54,7 @@
                          (try
                            {:name        test-name
                             :start-time  test-time
-                            :results     (store/load-results test-name test-time)}
+                            :results     (store/memoized-load-results test-name test-time)}
                            (catch java.io.FileNotFoundException e
                              ; Incomplete test
                              {:name       test-name
@@ -61,6 +62,7 @@
                               :results    {:valid? :incomplete}})
                            (catch java.lang.RuntimeException e
                              ; Um???
+                             (warn e "Unable to parse" test-name test-time)
                              {:name       test-name
                               :start-time test-time
                               :results    {:valid? :incomplete}})))
@@ -102,10 +104,14 @@
 (defn test-row
   "Turns a test map into a table row."
   [t]
-  (let [r (:results t)]
+  (let [r    (:results t)
+        time (->> t
+                  :start-time
+                  (timef/parse   (timef/formatters :basic-date-time))
+                  (timef/unparse (timef/formatters :date-hour-minute-second)))]
     [:tr
      [:td [:a {:href (url t "")} (:name t)]]
-     [:td [:a {:href (url t "")} (:start-time t)]]
+     [:td [:a {:href (url t "")} time]]
      [:td {:style (str "background: " (valid-color (:valid? r)))}
       (:valid? r)]
      [:td [:a {:href (url t "results.edn")}    "results.edn"]]
@@ -282,20 +288,35 @@
    :headers {"Content-Type" "text/plain"}
    :body "404 not found"})
 
+(def content-type
+  "Map of extensions to known content-types"
+  {"txt"  "text/plain"
+   "log"  "text/plain"
+   "edn"  "text/plain" ; Wrong, but we like seeing it in-browser
+   "json" "text/plain" ; Ditto
+   "html" "text/html"
+   "svg"  "image/svg+xml"})
+
 (defn files
   "Serve requests for /files/ urls"
   [req]
-  (let [pathname ((re-find #"^/files/(.+)$" (:uri req)) 1)
+  (let [pathname ((re-find #"^/files/(.+)\z" (:uri req)) 1)
+        ext      (when-let [m (re-find #"\.(\w+)\z" pathname)] (m 1))
         f    (File. store/base-dir pathname)]
     (assert-file-in-scope! f)
     (cond
       (.isFile f)
-      (response/file-response pathname
-                              {:root             store/base-dir
-                               :index-files?     false
-                               :allow-symlinks?  false})
+      (let [res (response/file-response pathname
+                                        {:root             store/base-dir
+                                         :index-files?     false
+                                         :allow-symlinks?  false})]
+          (if-let [ct (content-type ext)]
+            (-> res
+                (response/content-type ct)
+                (response/charset "utf-8"))
+            res))
 
-      (re-find #"\.zip\z" pathname)
+      (= ext "zip")
       (zip req f)
 
       (.isDirectory f)
@@ -316,5 +337,5 @@
   "Starts an http server with the given httpkit options."
   ([options]
    (let [s (server/run-server app options)]
-     (info "Web server running.")
+     (info "I'll see YOU after the function")
      s)))

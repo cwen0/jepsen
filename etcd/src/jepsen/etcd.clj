@@ -57,7 +57,7 @@
         (info node "installing etcd" version)
         (let [url (str "https://storage.googleapis.com/etcd/" version
                        "/etcd-" version "-linux-amd64.tar.gz")]
-          (cu/install-tarball! c/*host* url dir))
+          (cu/install-archive! url dir))
 
         (cu/start-daemon!
           {:logfile logfile
@@ -94,7 +94,7 @@
   "A client for a single compare-and-set register"
   [conn]
   (reify client/Client
-    (setup! [_ test node]
+    (open! [_ test node]
       (client (v/connect (client-url node)
                          {:timeout 5000})))
 
@@ -102,45 +102,45 @@
       (let [[k v] (:value op)
             crash (if (= :read (:f op)) :fail :info)]
         (try+
-          (case (:f op)
-            :read (let [value (-> conn
-                                  (v/get k {:quorum? false})
-                                  parse-long)]
-                    (assoc op :type :ok, :value (independent/tuple k value)))
+         (case (:f op)
+           :read (let [value (-> conn
+                                 (v/get k {:quorum? false})
+                                 parse-long)]
+                   (assoc op :type :ok, :value (independent/tuple k value)))
 
-            :write (do (v/reset! conn k v)
-                       (assoc op :type, :ok))
+           :write (do (v/reset! conn k v)
+                      (assoc op :type, :ok))
 
-            :cas (let [[value value'] v]
-                   (assoc op :type (if (v/cas! conn k value value'
-                                               {:prev-exist? true})
-                                     :ok
-                                     :fail))))
+           :cas (let [[value value'] v]
+                  (assoc op :type (if (v/cas! conn k value value'
+                                              {:prev-exist? true})
+                                    :ok
+                                    :fail))))
 
-          (catch java.net.SocketTimeoutException e
-            (assoc op :type crash, :error :timeout))
+         (catch java.net.SocketTimeoutException e
+           (assoc op :type crash, :error :timeout))
 
-          (catch [:errorCode 100] e
-            (assoc op :type :fail, :error :not-found))
+         (catch [:errorCode 100] e
+           (assoc op :type :fail, :error :not-found))
 
-          (catch [:body "command failed to be committed due to node failure\n"] e
-            (assoc op :type crash :error :node-failure))
+         (catch [:body "command failed to be committed due to node failure\n"] e
+           (assoc op :type crash :error :node-failure))
 
-          (catch [:status 307] e
-            (assoc op :type crash :error :redirect-loop))
+         (catch [:status 307] e
+           (assoc op :type crash :error :redirect-loop))
 
-          (catch (and (instance? clojure.lang.ExceptionInfo %)) e
-            (assoc op :type crash :error e))
+         (catch (and (instance? clojure.lang.ExceptionInfo %)) e
+           (assoc op :type crash :error e))
 
-          (catch (and (:errorCode %) (:message %)) e
-            (assoc op :type crash :error e)))))
+         (catch (and (:errorCode %) (:message %)) e
+           (assoc op :type crash :error e)))))
 
-    (teardown! [_ test]
-      ; If our connection were stateful, we'd close it here.
-      ; Verschlimmbesserung doesn't hold a connection open, so we don't need to
-      ; close it.
-      )))
+    ; If our connection were stateful, we'd close it here.
+    ; Verschlimmbesserung doesn't hold a connection open, so we don't need to.
+    (close! [_ _])
 
+    (setup! [_ _])
+    (teardown! [_ _])))
 
 (defn r   [_ _] {:type :invoke, :f :read, :value nil})
 (defn w   [_ _] {:type :invoke, :f :write, :value (rand-int 5)})
@@ -157,13 +157,13 @@
           :db (db "v3.1.5")
           :client (client nil)
           :nemesis (nemesis/partition-random-halves)
-          :model  (model/cas-register)
           :checker (checker/compose
                      {:perf     (checker/perf)
                       :indep (independent/checker
                                (checker/compose
                                  {:timeline (timeline/html)
-                                  :linear   (checker/linearizable)}))})
+                                  :linear   (checker/linearizable
+                                              {:model (model/cas-register)})}))})
           :generator (->> (independent/concurrent-generator
                             10
                             (range)
@@ -172,9 +172,9 @@
                                    (gen/stagger 1/30)
                                    (gen/limit 300))))
                           (gen/nemesis
-                            (gen/seq (cycle [(gen/sleep 5)
+                            (gen/seq (cycle [(gen/sleep 10)
                                              {:type :info, :f :start}
-                                             (gen/sleep 5)
+                                             (gen/sleep 10)
                                              {:type :info, :f :stop}])))
                           (gen/time-limit (:time-limit opts)))}
          opts))

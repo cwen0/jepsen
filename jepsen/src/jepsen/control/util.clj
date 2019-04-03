@@ -2,6 +2,7 @@
   "Utility functions for scripting installations."
   (:require [jepsen.control :refer :all]
             [jepsen.util :refer [meh]]
+            [clojure.data.codec.base64 :as b64]
             [clojure.java.io :refer [file]]
             [clojure.tools.logging :refer [info warn]]
             [clojure.string :as str]))
@@ -49,6 +50,15 @@
         (exec :mkdir :-p dir)
         dir))))
 
+(def std-wget-opts
+  "A list of standard options we pass to wget"
+  [:--tries 20
+   :--waitretry 60
+   :--retry-connrefused
+   :--dns-timeout 60
+   :--connect-timeout 60
+   :--read-timeout 60])
+
 (defn wget!
   "Downloads a string URL and returns the filename as a string. Skips if the
   file already exists."
@@ -59,15 +69,39 @@
      (when force?
        (exec :rm :-f filename))
      (when (not (exists? filename))
-       (exec :wget
-             :--tries 20
-             :--waitretry 60
-             :--retry-connrefused
-             :--dns-timeout 60
-             :--connect-timeout 60
-             :--read-timeout 60
-             url))
+       (exec :wget std-wget-opts url))
      filename)))
+
+(def wget-cache-dir
+  "Directory for caching files from the web."
+  (str tmp-dir-base "/wget-cache"))
+
+(defn cached-wget!
+  "Downloads a string URL to the Jepsen wget cache directory, and returns the
+  full local filename as a string. Skips if the file already exists. Local
+  filenames are base64-encoded URLs, as opposed to the name of the file--this
+  is helpful when you want to download a package like
+  https://foo.com/v1.2/foo.tar; since the version is in the URL but not a part
+  of the filename, downloading a new version could silently give you the old
+  version instead.
+
+  Options:
+
+    :force?     Even if we have this cached, download the tarball again anyway."
+  ([url]
+   (wget! url {:force? false}))
+  ([url opts]
+   (let [encoded-url (String. (b64/encode (.getBytes url)) "UTF-8")
+         dest-file   (str wget-cache-dir "/" encoded-url)]
+     (when (:force? opts)
+       (info "Clearing cached copy of" url)
+       (exec :rm :-rf dest-file))
+     (when-not (exists? dest-file)
+       (info "Downloading" url)
+       (do (exec :mkdir :-p wget-cache-dir)
+           (cd wget-cache-dir
+               (exec :wget std-wget-opts :-O dest-file url))))
+     dest-file)))
 
 (defn install-archive!
   "Gets the given tarball URL, caching it in /tmp/jepsen/, and extracts its
@@ -85,10 +119,7 @@
    (install-archive! url dest false))
   ([url dest force?]
    (let [local-file (nth (re-find #"file://(.+)" url) 1)
-         file       (or local-file
-                        (do (exec :mkdir :-p tmp-dir-base)
-                            (cd tmp-dir-base
-                                (expand-path (wget! url force?)))))
+         file       (or local-file (cached-wget! url {:force? force?}))
          tmpdir     (tmp-dir!)
          dest       (expand-path dest)]
 
@@ -100,9 +131,10 @@
      (try
        (cd tmpdir
            ; Extract archive to tmpdir
-           (if (re-find #".*\.zip$" file)
+           (if (re-find #".*\.zip$" url)
              (exec :unzip file)
-             (exec :tar :xf file))
+             (exec :tar :--no-same-owner :--no-same-permissions
+                   :--extract :--file file))
 
            ; Force ownership
            (when (= "root" *sudo*)
@@ -186,7 +218,10 @@
   :pidfile
   :process-name"
   [opts bin & args]
-  (info "starting" (.getName (file bin)))
+  (info "starting" (.getName (file (name bin))))
+  (exec :echo (lit "`date +'%Y-%m-%d %H:%M:%S'`")
+        "Jepsen starting" bin (str/join " " args)
+        :>> (:logfile opts))
   (apply exec :start-stop-daemon :--start
          (when (:background? opts true) [:--background :--no-close])
          (when (:make-pidfile? opts true) :--make-pidfile)
@@ -204,8 +239,8 @@
   "Kills a daemon process by pidfile, or, if given a command name, kills all
   processes with that command name, and cleans up pidfile."
   ([pidfile]
-   (info "Stopping" pidfile)
    (when (exists? pidfile)
+     (info "Stopping" pidfile)
      (let [pid (Long/parseLong (exec :cat pidfile))]
        (meh (exec :kill :-9 pid))
        (meh (exec :rm :-rf pidfile)))))
@@ -214,3 +249,16 @@
    (info "Stopping" cmd)
    (meh (exec :killall :-9 :-w cmd))
    (meh (exec :rm :-rf pidfile))))
+
+(defn daemon-running?
+  "Given a pidfile, returns true if the pidfile is present and the process it
+  contains is alive, nil if the pidfile is absent, false if it's present and
+  the process doesn't exist.
+
+  Strictly this doesn't mean the process is RUNNING; it could be asleep or a
+  zombie, but you know what I mean. ;-)"
+  [pidfile]
+  (when-let [pid (meh (exec :cat pidfile))]
+    (try (exec :ps :-o "pid=" :-p pid)
+         (catch RuntimeException e
+           false))))

@@ -14,7 +14,10 @@
 
 (defrecord BankClient [node n starting-balance lock-type in-place?]
   client/Client
-  (setup! [this test node]
+  (open! [this test node]
+    (assoc this :node node))
+
+  (setup! [this test]
     (j/with-db-connection [c (conn-spec (first (:nodes test)))]
       (j/execute! c ["create table if not exists accounts
                      (id     int not null primary key,
@@ -23,9 +26,7 @@
         (try
           (with-txn-retries
             (j/insert! c :accounts {:id i, :balance starting-balance}))
-          (catch java.sql.SQLIntegrityConstraintViolationException e nil))))
-
-    (assoc this :node node))
+          (catch java.sql.SQLIntegrityConstraintViolationException e nil)))))
 
   (invoke! [this test op]
     (with-txn op [c (first (:nodes test))]
@@ -61,7 +62,9 @@
                         (j/update! c :accounts {:balance b2} ["id = ?" to])
                         (assoc op :type :ok)))))))))
 
-  (teardown! [_ test]))
+  (teardown! [_ test])
+
+  (close! [_ test]))
 
 (defn bank-client
   "Simulates bank account transfers between n accounts, each starting with
@@ -92,9 +95,9 @@
 
 (defn bank-checker
   "Balances must all be non-negative and sum to the model's total."
-  []
+  [model]
   (reify checker/Checker
-    (check [this test model history opts]
+    (check [this test history opts]
       (let [bad-reads (->> history
                            (r/filter op/ok?)
                            (r/filter #(= :read (:f %)))
@@ -119,24 +122,22 @@
 (defn bank-test-base
   [opts]
   (basic/basic-test
-   (merge
-    {:client      {:client (:client opts)
-                   :during (->> (gen/mix [bank-read bank-diff-transfer])
-                                (gen/clients)
-                                (gen/stagger 0))
-                   :final (gen/clients (gen/once bank-read))}
-     :checker     (checker/compose
-                   {:perf    (checker/perf)
-                    :details (bank-checker)})}
-    (dissoc opts :client))))
+    (merge
+      {:client      {:client (:client opts)
+                     :during (->> (gen/mix [bank-read bank-diff-transfer])
+                                  (gen/clients))
+                     :final (gen/clients (gen/once bank-read))}
+       :checker     (checker/compose
+                      {:perf    (checker/perf)
+                       :details (bank-checker {:n 5 :total 50})})}
+      (dissoc opts :client))))
 
 (defn test
   [opts]
   (bank-test-base
-   (merge {:name   "bank"
-           :model  {:n 5 :total 50}
-           :client (bank-client 5 10 " FOR UPDATE" false)}
-          opts)))
+    (merge {:name   "bank"
+            :client (bank-client 5 10 " FOR UPDATE" false)}
+           opts)))
 
 ; One bank account per table
 (defrecord MultiBankClient [node tbl-created? n starting-balance lock-type in-place?]

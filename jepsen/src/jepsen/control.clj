@@ -2,14 +2,15 @@
   "Provides SSH control over a remote node. There's a lot of dynamically bound
   state in this namespace because we want to make it as simple as possible for
   scripts to open connections to various nodes."
+  (:import java.io.File)
   (:require [clj-ssh.ssh    :as ssh]
             [jepsen.util    :as util :refer [real-pmap
-                                             with-retry
                                              with-thread-name]]
+            [dom-top.core :refer [with-retry]]
             [jepsen.reconnect :as rc]
             [clojure.string :as str]
-            [clojure.pprint :refer [pprint]]
-            [clojure.tools.logging :refer [warn info debug]]))
+            [clojure.tools.logging :refer [warn info debug error]]
+            [slingshot.slingshot :refer [try+ throw+]]))
 
 ; STATE STATE STATE STATE
 (def ^:dynamic *dummy*    "When true, don't actually use SSH" nil)
@@ -115,22 +116,18 @@
 (defn wrap-trace
   "Logs argument to console when tracing is enabled."
   [arg]
-  (do (when *trace* (info arg))
+  (do (when *trace* (info "Host:" *host* "arg:" arg))
       arg))
 
 (defn throw-on-nonzero-exit
-  "Throws when the result of an SSH result has nonzero exit status."
-  [result]
-  (if (zero? (:exit result))
+  "Throws when an SSH result has nonzero exit status."
+  [{:keys [exit action] :as result}]
+  (if (zero? exit)
     result
-    (throw
-      (RuntimeException.
-        (str (:cmd (:action result))
-             " returned non-zero exit status " (:exit result)
-             " on " (:host result) ". STDOUT:\n"
-             (:out result)
-             "\n\nSTDERR:\n"
-             (:err result))))))
+    (throw+
+     (merge {:type ::nonzero-exit
+             :cmd (:cmd action)}
+            result))))
 
 (defn just-stdout
   "Returns the stdout from an ssh result, trimming any newlines at the end."
@@ -143,9 +140,9 @@
   [action]
   (with-retry [tries *retries*]
     (when (nil? *session*)
-      (throw (RuntimeException.
-              (str "Unable to perform an SSH action because no SSH session for this host is available. SSH configuration is:\n\n"
-                   (with-out-str (pprint (debug-data)))))))
+      (throw+ (merge {:type ::no-session-available
+                      :message "Unable to perform an SSH action because no SSH session for this host is available."}
+                     (debug-data))))
 
     (rc/with-conn [s *session*]
       (assoc (ssh/ssh s action)
@@ -157,7 +154,8 @@
                    (= "Packet corrupt" (.getMessage e))))
         (do (Thread/sleep (+ 1000 (rand-int 1000)))
             (retry (dec tries)))
-        (throw e)))))
+        (throw+ (merge {:type ::ssh-failed}
+                       (debug-data)))))))
 
 (defn exec*
   "Like exec, but does not escape."
@@ -187,19 +185,33 @@
   (rc/with-conn [s *session*]
     (ssh/scp-to *session* current-path node-path)))
 
+(defn file->path
+  "Takes an object, if it's an instance of java.io.File, gets the path, otherwise
+  returns the object"
+  [x]
+  (if (instance? java.io.File x)
+    (.getCanonicalPath x)
+    x))
+
 (defn upload
-  "Copies local path(s) to remote node. Takes arguments for clj-ssh/scp-to."
-  [& args]
+  "Copies local path(s) to remote node and returns the remote path.
+  Takes arguments for clj-ssh/scp-to."
+  [& [local-paths remote-path & remaining]]
   (with-retry [tries *retries*]
     (rc/with-conn [s *session*]
-      (apply ssh/scp-to s args))
+      (let [local-paths (if (sequential? local-paths)
+                          (map file->path local-paths)
+                          (file->path local-paths))]
+        (apply ssh/scp-to s local-paths remote-path remaining)
+        remote-path))
     (catch com.jcraft.jsch.JSchException e
       (if (and (pos? tries)
                (or (= "session is down" (.getMessage e))
                    (= "Packet corrupt" (.getMessage e))))
         (do (Thread/sleep (+ 1000 (rand-int 1000)))
             (retry (dec tries)))
-        (throw e)))))
+        (throw+ (merge {:type ::upload-failed}
+                       (debug-data)))))))
 
 (defn download
   "Copies remote paths to local node. Takes arguments for clj-ssh/scp-from.
@@ -214,7 +226,8 @@
                    (= "Packet corrupt" (.getMessage e))))
         (do (Thread/sleep (+ 1000 (rand-int 1000)))
             (retry (dec tries)))
-        (throw e)))))
+        (throw+ (merge {:type ::download-failed}
+                       (debug-data)))))))
 
 (defn expand-path
   "Expands path relative to the current directory."
@@ -251,10 +264,22 @@
   `(binding [*trace* true]
      ~@body))
 
+(defn check-name
+  "Ensures a given hostname is string. Warns user if legacy behavior passes in a
+  keyword host.
+  TODO This can be removed when tests no tests generate keyword hosts. CLI already
+       refuses keyword hostnames."
+  [host]
+  (when (keyword? host)
+    (warn (str "DEPRECATED: Host "
+               host
+               " is a keyword; please provide node hostnames as strings. Support for keyword hosts will be removed in future versions of jepsen.")))
+  (name host))
+
 (defn clj-ssh-session
   "Opens a raw session to the given host."
   [host]
-  (let [host  (name host)
+  (let [host  (check-name host)
         agent (ssh/ssh-agent {})
         _     (when *private-key-path*
                 (ssh/add-identity agent
@@ -271,14 +296,20 @@
   "Wraps clj-ssh-session in a wrapper for reconnection."
   [host]
   (rc/open!
-    (rc/wrapper {:open    (if *dummy*
-                            (fn [] [:dummy host])
-                            (fn [] (clj-ssh-session host)))
-                 :name    [:control host]
-                 :close   (if *dummy*
-                            identity
-                            ssh/disconnect)
-                 :log?    true})))
+   (rc/wrapper {:open  (if *dummy*
+                         (fn [] [:dummy host])
+                         (fn [] (try+
+                                  (clj-ssh-session host)
+                                  (catch com.jcraft.jsch.JSchException _
+                                    (throw+ (merge {:type ::session-error
+                                                    :message "Error opening SSH session. Verify username, password, and node hostnames are correct."
+                                                    :host host}
+                                                   (debug-data)))))))
+                :name  [:control host]
+                :close (if *dummy*
+                         identity
+                         ssh/disconnect)
+                :log?  true})))
 
 (defn disconnect
   "Close a session"
@@ -286,7 +317,8 @@
   (rc/close! session))
 
 (defmacro with-ssh
-  "Takes a map of SSH configuration and evaluates body in that scope. Options:
+  "Takes a map of SSH configuration and evaluates body in that scope. Catches
+  JSchExceptions and re-throws with all available debugging context. Options:
 
   :dummy?
   :username
@@ -316,7 +348,7 @@
   session when body completes."
   [host & body]
   `(let [session# (session ~host)]
-     (try
+     (try+
        (with-session ~host session#
          ~@body)
        (finally

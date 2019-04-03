@@ -1,4 +1,5 @@
 (ns jepsen.core-test
+  (:refer-clojure :exclude [run!])
   (:use jepsen.core
         clojure.test
         clojure.pprint
@@ -11,14 +12,37 @@
             [jepsen.client :as client]
             [jepsen.generator :as gen]
             [jepsen.store :as store]
-            [jepsen.model :as model]
-            [jepsen.checker :as checker]))
+            [jepsen.checker :as checker]
+            [jepsen.nemesis :as nemesis]
+            [knossos.model :as model]))
 
-(deftest basic-cas-test
+(defn tracking-client
+  "Tracks connections in an atom."
+  ([conns]
+   (tracking-client conns (atom 0)))
+  ([conns uid]
+   (reify client/Client
+     (open! [c test node]
+       (let [uid (swap! uid inc)] ; silly hack
+         (swap! conns conj uid)
+         (tracking-client conns uid)))
+
+     (setup! [c test] c)
+
+     (invoke! [c test op]
+       (assoc op :type :ok))
+
+     (teardown! [c test] c)
+
+     (close! [c test]
+       (swap! conns disj uid)))))
+
+(deftest ^:integration basic-cas-test
   (let [state (atom nil)
         db    (tst/atom-db state)
         n     10
         test  (run! (assoc tst/noop-test
+                           :name       "basic cas"
                            :db         (tst/atom-db state)
                            :client     (tst/atom-client state)
                            :generator  (->> gen/cas
@@ -27,7 +51,7 @@
                            :model      (model/->CASRegister 0)))]
     (is (:valid? (:results test)))))
 
-(deftest ssh-test
+(deftest ^:integration ssh-test
   (let [os-startups  (atom {})
         os-teardowns (atom {})
         db-startups  (atom {})
@@ -83,19 +107,72 @@
             "n5" "n5"}))
     (is (= @db-primaries ["n1"]))))
 
-(deftest worker-recovery-test
+(deftest ^:integration worker-recovery-test
   ; Workers should only consume n ops even when failing.
   (let [invocations (atom 0)
-        n 30]
+        n 12]
     (run! (assoc tst/noop-test
+                 :name "worker recovery"
                  :client (reify client/Client
-                           (setup! [c _ _] c)
+                           (open!  [c t n] c)
+                           (setup! [c t])
                            (invoke! [_ _ _]
                              (swap! invocations inc)
-                             (assert false))
-                           (teardown! [c _]))
+                             (/ 1 0))
+                           (teardown! [c t])
+                           (close! [c t]))
                  :checker  (checker/unbridled-optimism)
                  :generator (->> (gen/queue)
                                  (gen/limit n)
                                  (gen/nemesis gen/void))))
       (is (= n @invocations))))
+
+(deftest ^:integration generator-recovery-test
+  ; Throwing an exception from a generator shouldn't break the core. We use
+  ; gen/phases to force a synchronization barrier in the generator, which would
+  ; ordinarily deadlock when one worker thread prematurely exits, and prove
+  ; that we can knock other worker threads out of that barrier and have them
+  ; abort cleanly.
+  (let [conns (atom #{})]
+    (is (thrown-with-msg?
+          ArithmeticException #"Divide by zero"
+          (run! (assoc tst/noop-test
+                       :name "generator recovery"
+                       :client (tracking-client conns)
+                       :generator (gen/clients
+                                    (gen/phases
+                                      (gen/each
+                                        (gen/once
+                                          (reify gen/Generator
+                                            (op [_ test process]
+                                              (if (= process 0)
+                                                (/ 1 0)
+                                                {:type :invoke, :f :meow})))))
+                                      (gen/once {:type :invoke, :f :done})))))))
+    (is (empty? @conns))))
+
+(deftest ^:integration worker-error-test
+  ; Errors in client and nemesis setup and teardown should be rethrown from
+  ; tests.
+  (let [client (fn [t]
+                 (reify client/Client
+                   (open!     [c test node] (if (= :open t)  (assert false) c))
+                   (setup!    [c test]      (if (= :setup t) (assert false)))
+                   (invoke!   [c test op]   (assoc op :type :ok))
+                   (teardown! [c test]      (if (= :teardown t) (assert false)))
+                   (close!    [c test]      (if (= :close t) (assert false)))))
+        nemesis (fn [t]
+                  (reify nemesis/Nemesis
+                    (setup! [n test]        (if (= :setup t) (assert false) n))
+                    (invoke! [n test op]    op)
+                    (teardown! [n test]     (if (= :teardown t) (assert false)))))
+        test (fn [client-type nemesis-type]
+               (run! (assoc tst/noop-test
+                            :client   (client client-type)
+                            :nemesis  (nemesis nemesis-type))))]
+    (testing "client open"      (is (thrown-with-msg? AssertionError #"false" (test :open  nil))))
+    (testing "client setup"     (is (thrown-with-msg? AssertionError #"false" (test :setup nil))))
+    (testing "client teardown"  (is (thrown-with-msg? AssertionError #"false" (test :teardown nil))))
+    (testing "client close"     (is (thrown-with-msg? AssertionError #"false" (test :close nil))))
+    (testing "nemesis setup"    (is (thrown-with-msg? AssertionError #"false" (test :setup nil))))
+    (testing "nemesis teardown" (is (thrown-with-msg? AssertionError #"false" (test :teardown nil))))))

@@ -9,8 +9,17 @@ been used to verify everything from eventually-consistent commutative databases
 to linearizable coordination systems to distributed task schedulers. It can
 also generate graphs of performance and availability, helping you characterize
 how a system responds to different faults. See
-[aphyr.com](https://aphyr.com/tags/jepsen) for examples of the sorts of
-analyses you can carry out with Jepsen.
+[jepsen.io](https://jepsen.io/analyses) for examples of the sorts of analyses
+you can carry out with Jepsen.
+
+[![Build Status](https://travis-ci.com/jepsen-io/jepsen.svg?branch=master)](https://travis-ci.com/jepsen-io/jepsen)
+
+## Documentation
+
+This [tutorial](doc/tutorial/index.md) walks you through writing a Jepsen test
+from scratch.
+
+For reference, see the [API documentation](http://jepsen-io.github.io/jepsen/).
 
 ## Design overview
 
@@ -32,10 +41,10 @@ history, analysis, and any supplementary results are written to the filesystem
 under `store/<test-name>/<date>/` for later review. Symlinks to the latest
 results are maintained at each level for convenience.
 
-
 ## Setting up a Jepsen environment
 
-Your local machine needs a JVM and leiningen 2 installed. Probably want JNA for SSH auth too.
+Your control node needs a JVM and Leiningen 2 installed. Probably want JNA for
+SSH auth too.
 
 ```sh
 sudo apt-get install openjdk-8-jre openjdk-8-jre-headless libjna-java
@@ -55,7 +64,8 @@ at your prod machines unless you like to live dangerously, or you wrote the
 test and know exactly what it's doing.
 
 You can run your DB nodes as separate physical machines, VMs, LXC instances, or
-via Docker.
+via Docker. Note that containers (LXC and Docker) can't change system clocks,
+so you won't be able to test anything that relies on clock skew.
 
 - You can launch a complete Jepsen cluster from the [AWS
   Marketplace](https://aws.amazon.com/marketplace/pp/B01LZ7Y7U0?qid=1486758124485&sr=0-1&ref_=srh_res_product_title).
@@ -85,24 +95,31 @@ INFO  jepsen.core - Analysis invalid! (ﾉಥ益ಥ）ﾉ ┻━┻
    ...}}
 ```
 
-## Writing a test
-
-If you don't know Clojure, you'll want to learn some of the basics. Try
-[Clojure From the Ground
-Up](https://aphyr.com/posts/301-clojure-from-the-ground-up-welcome) and
-[Clojure for the Brave and True](http://www.braveclojure.com/). Or you can
-reimplement Jepsen's ideas in a language you *do* know. Either way's fine!
-
-For a complete guide to writing a test, start with
-[scaffolding](doc/scaffolding.md).
-
 ## FAQ
 
 ### JSCH auth errors
 
-You might be hitting a jsch bug which doesn't know how to read hashed
-known_hosts files. Remove all keys for the DB hosts from your `known_hosts`
-file, then:
+If you see `com.jcraft.jsch.JSchException: Auth fail`, this means something
+about your test's `:ssh` map is wrong, or your control node's SSH environment
+is a bit weird.
+
+0. Confirm that you can ssh to the node that Jepsen failed to connect to. Try
+   `ssh -v` for verbose information--pay special attention to whether it uses a
+   password or private key.
+1. If you intend to use a username and password, confirm that they're specified
+   correctly in your test's `:ssh` map.
+2. If you intend to log in with a private key, make sure your SSH agent is
+   running.
+   - `ssh-add -l` should show the key you use to log in.
+   - If your agent isn't running, try lauching one with `ssh-agent`.
+   - If your agent shows no keys, you might need to add it with `ssh-add`.
+   - If you're SSHing to a control node, SSH might be forwarding your local
+     agent's keys rather than using those on the control node. Try `ssh -a` to
+     disable agent forwarding.
+
+If you've SSHed to a DB node already, you might also encounter a jsch bug which
+doesn't know how to read hashed known_hosts files. Remove all keys for the DB
+hosts from your `known_hosts` file, then:
 
 ```sh
 ssh-keyscan -t rsa n1 >> ~/.ssh/known_hosts

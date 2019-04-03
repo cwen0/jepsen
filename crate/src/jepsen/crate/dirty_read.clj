@@ -16,87 +16,100 @@
                     [os           :as os]]
             [jepsen.os.debian     :as debian]
             [jepsen.checker.timeline :as timeline]
-            [jepsen.crate         :as c]
+            [jepsen.crate.core    :as c]
+            [clojure.java.jdbc    :as j]
             [clojure.string       :as str]
             [clojure.set          :as set]
             [clojure.pprint :refer [pprint]]
             [clojure.tools.logging :refer [info warn]]
             [knossos.op           :as op])
-  (:import (io.crate.client CrateClient)
-           (io.crate.action.sql SQLActionException
-                                SQLResponse
-                                SQLRequest)
-           (io.crate.shade.org.elasticsearch.client.transport
+  (:import (org.elasticsearch.action NoShardAvailableActionException)
+           (org.elasticsearch.client.transport
+             TransportClient
              NoNodeAvailableException)))
 
-(defn client
-  ([] (client nil (atom 0)))
-  ([conn limit]
-   (let [initialized? (promise)]
-    (reify client/Client
-      (setup! [this test node]
-        (let [conn (c/await-client (c/connect node) test)]
-          (when (deliver initialized? true)
-            (c/sql! conn "create table dirty_read (
-                           id integer primary key
-                         ) with (number_of_replicas = \"0-all\")"))
-          (client conn limit)))
+(defrecord DirtyReadClient [tbl-created? conn limit]
+  client/Client
 
-      (invoke! [this test op]
-        (timeout (case (:f op)
-                   :refresh 60000
-                   :strong-read 60000
-                   100)
-                 (assoc op :type :info, :error :timeout)
-                 (c/with-errors op
-                   (case (:f op)
-                     ; Read a specific ID
-                     :read (let [v (->> (c/sql! conn "select id from dirty_read
-                                                     where id = ?"
-                                                (:value op))
-                                        :rows
-                                        first
-                                        :id)]
-                             (assoc op :type (if v :ok :fail)))
+  (setup! [this test])
 
-                     ; Refresh table
-                     :refresh (do (c/sql! conn "refresh table dirty_read")
-                                  (assoc op :type :ok))
+  (open! [this test node]
+    (let [conn (c/jdbc-client node)]
+      (info node "Connected")
+      ;; Everyone's gotta block until we've made the table.
+      (locking tbl-created?
+        (when (compare-and-set! tbl-created? false true)
+          (c/with-conn [c conn]
+            (j/execute! c ["drop table if exists dirty_read"])
+            (info node "Creating table dirty_read")
+            (j/execute! c
+                         ["create table dirty_read (
+                          id     integer primary key)"])
+            (j/execute! c
+                         ["alter table dirty_read
+                          set (number_of_replicas = \"0-all\")"]))))
 
-                     ; Perform a full read of all IDs
-                     :strong-read
-                     (do (->> (c/sql! conn
-                                      "select id from dirty_read LIMIT ?"
-                                      (+ 100 @limit)) ; who knows
-                              :rows
-                              (map :id)
-                              (into (sorted-set))
-                              (assoc op :type :ok, :value)))
+      (assoc this :conn conn)))
 
-                     ; Add an ID
-                     :write (do (swap! limit inc)
-                                (c/sql! conn
-                                        "insert into dirty_read (id) values (?)"
-                                        (:value op))
-                                (assoc op :type :ok))))))
+  (invoke! [this test op]
+    (c/with-exception->op op
+      (c/with-conn [c conn]
+        (c/with-timeout
+          (c/with-txn [c c]
+            (assoc op :type :info, :error :timeout)
+            (c/with-errors op
+              (case (:f op)
+                ; Read a specific ID
+                :read (let [v (->> (c/query c  ["select id from dirty_read
+                                                    where id = ?"
+                                                    (:value op)])
+                                   first
+                                   :id)]
+                        (assoc op :type (if v :ok :fail)))
 
-      (teardown! [this test]
-        (.close conn))))))
+                ; Refresh table
+                :refresh (do (j/execute! c ["refresh table dirty_read"] 
+                                         {:timeout 60000})
+                             (assoc op :type :ok))
+
+                ; Perform a full read of all IDs
+                :strong-read
+                (do (->> (c/query c
+                                  ["select id from dirty_read LIMIT ?"
+                                   (+ 100 @limit)]) ; who knows
+                         (map :id)
+                         (into (sorted-set))
+                         (assoc op :type :ok, :value)))
+
+                ; Add an ID
+                :write (do (swap! limit inc)
+                           (j/execute! c
+                                       ["insert into dirty_read (id) values (?)"
+                                        (:value op)]
+                                       {:timeout c/timeout-delay})
+                           (assoc op :type :ok)))))))))
+
+        (close! [this test])
+
+        (teardown! [this test]
+                   ))
 
 (defn es-client
   "Elasticsearch based client. Wraps an underlying Crate client for some ops.
   Options:
 
   :es-ops     Set of operation :f's to put through elasticsearch (instead of
-              crate)"
-  ([opts] (es-client (:es-ops opts) (client) nil))
-  ([es-ops crate es]
+  crate)"
+  ([opts] (es-client (:es-ops opts) (DirtyReadClient. (atom false) nil (atom 0)) nil))
+  ([es-ops crate ^TransportClient es]
    (assert (set? es-ops))
    (reify client/Client
-     (setup! [this test node]
-       (let [crate (client/setup! crate test node)
+     (open! [this test node]
+       (let [crate (client/open! crate test node)
              es    (c/es-connect node)]
          (es-client es-ops crate es)))
+
+     (setup! [this test])
 
      (invoke! [this test op]
        (if-not (es-ops (:f op))
@@ -114,12 +127,14 @@
                     (let [v (-> (c/es-get es "dirty_read" "default" (:value op))
                                 :source
                                 :id)]
-                         (assoc op :type (if v :ok :fail)))
+                      (assoc op :type (if v :ok :fail)))
 
                     :write
                     (do (c/es-index! es "dirty_read" "default"
                                      {:id (:value op)})
                         (assoc op :type :ok))))))
+
+     (close! [this test])
 
      (teardown! [this test]
        (client/teardown! crate test)
@@ -219,13 +234,13 @@
   [opts]
   (merge tests/noop-test
          {:name    (let [o (:es-ops opts)]
-                     (str "crate lost-updates "
+                     (str "dirty-read "
                           (str/join " " [(str "r="  (if (:read o)  "e" "c"))
                                          (str "w="  (if (:write o) "e" "c"))
                                          (str "sr=" (if (:strong-read o)
                                                       "e" "c"))])))
           :os      debian/os
-          :db      (c/db)
+          :db      (c/db (:tarball opts))
           :client  (es-client opts)
           :checker (checker/compose
                      {:dirty-read (checker)
@@ -236,10 +251,10 @@
                        (->> (rw-gen (/ (:concurrency opts) 3))
                             (gen/stagger 1/10)
                             (gen/nemesis ;nil)
-                              (gen/seq (cycle [(gen/sleep 10)
-                                               {:type :info, :f :start}
-                                               (gen/sleep 20)
-                                               {:type :info, :f :stop}])))
+                                         (gen/seq (cycle [(gen/sleep 10)
+                                                          {:type :info, :f :start}
+                                                          (gen/sleep 20)
+                                                          {:type :info, :f :stop}])))
                             (gen/time-limit (:time-limit opts)))
                        (gen/nemesis (gen/once {:type :info :f :stop}))
                        (gen/clients (gen/each
