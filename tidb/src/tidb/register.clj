@@ -2,10 +2,10 @@
   "Single atomic register test"
   (:refer-clojure :exclude [test])
   (:require [jepsen [client :as client]
-                    [checker :as checker]
-                    [generator :as gen]
-                    [independent :as independent]
-                    [util :refer [meh]]]
+             [checker :as checker]
+             [generator :as gen]
+             [independent :as independent]
+             [util :refer [meh]]]
             [jepsen.checker.timeline :as timeline]
             [clojure.java.jdbc :as j]
             [clojure.tools.logging :refer :all]
@@ -19,6 +19,8 @@
 
 (defrecord RegisterClient [node]
   client/Client
+  ; (open! [this test node]
+  ;   (assoc this :conn (open node)))
 
   (setup! [this test node]
     (j/with-db-connection [c (conn-spec (first (:nodes test)))]
@@ -51,25 +53,54 @@
 
   (teardown! [this test]))
 
-(defn test
+(defn register-test-base
   [opts]
   (basic/basic-test
-    (merge
-      {:name        "register"
-       :client      {:client (RegisterClient. nil)
-                     :during (independent/concurrent-generator
-                               10
-                               (range)
-                               (fn [k]
-                                 (->> (gen/reserve 5 (gen/mix [w cas cas]) r)
-                                      (gen/delay-til 1/2)
-                                      (gen/stagger 0.1)
-                                      (gen/limit 100))))}
-       :checker     (checker/compose
-                      {:perf   (checker/perf)
-                       :indep (independent/checker
-                                (checker/compose
-                                  {:timeline (timeline/html)
-                                   :linear   (checker/linearizable
-                                               {:model (model/cas-register 0)})}))})}
-      opts)))
+   (merge
+    {:client {:client (:client opts)
+              :during (:during opts)
+              :during (independent/concurrent-generator
+                       10
+                       (range)
+                       (fn [k]
+                         (->> (gen/reserve 5 (gen/mix [w cas cas]) r)
+                              (gen/delay-til 1/2)
+                              (gen/stagger 1/10)
+                              (gen/limit 100))))}
+     :checker (checker/compose
+               {:perf (checker/perf)
+                :indep (independent/checker
+                        (checker/compose
+                         {:timeline (timeline/html)
+                          :linear (checker/linearizable
+                                   {:model (:model opts)})}))})}
+    (dissoc opts :client :during :model))))
+
+(defn test
+  [opts]
+  (register-test-base
+   (merge {:name "register"
+           :client (RegisterClient. nil)
+           :model (model/cas-register 0)}
+          opts)))
+
+(defrecord MultiRegisterClient [node]
+  client/Client
+  (setup! [this test node]
+    (j/with-db-connection [c (conn-spec (first (:nodes test)))]
+      (j/execute! c [str ("create table if not exists test "
+                          " (id int primary key, val int, ik int)")]))
+    (assoc this :node node))
+
+  (invoke! [this test op])
+
+  (teardown! [this test]))
+
+(defn multi-register-test
+  [opts]
+  (register-test-base
+   (merge {:name "multi-register"
+           :client (MultiRegisterClient. nil)
+           :model (multi-register {})}
+          opts)))
+

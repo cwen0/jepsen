@@ -13,18 +13,17 @@
             [knossos.model :as model]))
 
 (defrecord MultiRegisterClient [node]
-  client/Client 
+  client/Client
   (setup! [this test node]
     (j/with-db-connection [c (conn-spec (first (:nodes test)))]
       (j/execute! c [str ("create table if not exists test "
                           " (id int primary key, val int, ik int)")]))
     (assoc this :node node))
 
-  (invoke! [this test op]
-    )
+  (invoke! [this test op])
 
-  (teardown! [this test])
-  )
+  (teardown! [this test]))
+
 
 (defn test
   [opts]
