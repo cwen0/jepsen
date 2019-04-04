@@ -5,26 +5,27 @@
             [clojure.tools.logging :refer [info warn]]
             [slingshot.slingshot :refer [try+ throw+]]))
 
-(def connect-timeout 120000)
-(def socket-timeout  10000)
-(def login-timeout   5000)
+(def connect-timeout 10000)
+(def socket-timeout  20000)
+(def open-timeout
+  "How long will we wait for an open call?"
+  100000)
 
 (defn conn-spec
   "jdbc connection spec for a node."
   [node]
-  {:classname   "org.mariadb.jdbc.Driver"
-   :subprotocol "mariadb"
-   :subname     (str "//" (name node) ":4000/test")
-   :user        "root"
-   :password    ""
-   :loginTimeout   (/ login-timeout 1000)
-   :connectTimeout (/ connect-timeout 1000)
-   :socketTimeout  (/ socket-timeout 1000)})
+  {:classname       "org.mariadb.jdbc.Driver"
+   :subprotocol     "mariadb"
+   :subname         (str "//" (name node) ":4000/test")
+   :user            "root"
+   :password        ""
+   :connectTimeout  connect-timeout
+   :socketTimeout   socket-timeout})
 
 (defn open
   "Opens a connection to the given node."
   [node]
-  (timeout connect-timeout
+  (timeout open-timeout
            (throw+ {:type :connect-timed-out
                     :node node})
            (util/retry 1
@@ -34,8 +35,11 @@
                                spec'  (j/add-connection spec conn)]
                            (assert spec')
                            spec')
+                         (catch java.sql.SQLNonTransientConnectionException e
+                           ; Conn refused
+                           (throw e))
                          (catch Throwable t
-                           (info t "caught, retrying")
+                           (info t "Unexpected connection error, retrying")
                            (throw t))))))
 
 (defn close!
@@ -56,16 +60,11 @@
   (info "Waiting for" node)
   (if (let [c (open node)]
         (try
-          (info "Creating table")
           (j/execute! c ["create table if not exists jepsen_await
                          (id int primary key, val int)"])
-          (info "Inserting record")
-          (j/insert! c "jepsen_await" {:id (swap! await-id inc) :val (rand-int 5)})
+          (j/insert! c "jepsen_await" {:id  (swap! await-id inc)
+                                       :val (rand-int 5)})
           true
-          (catch java.sql.SQLNonTransientConnectionException e
-            (if (re-find #"Last packet not finished" (.getMessage e))
-              (info "Last packet not finished, retrying")
-              (throw e)))
           (finally
             (close! c))))
     (info node "ready")
@@ -122,11 +121,11 @@
 (defmacro with-txn
   "Executes body in a transaction, with a timeout, automatically retrying
   conflicts and handling common errors."
-  [op [c node] & body]
-  `(timeout 5000 (assoc ~op :type :info, :value :timed-out)
+  [op [c conn] & body]
+  `(timeout (+ 1000 socket-timeout) (assoc ~op :type :info, :value :timed-out)
             (with-error-handling ~op
               (with-txn-retries
-                (j/with-db-transaction [~c (conn-spec ~node)]
+                (j/with-db-transaction [~c ~conn]
                   (j/execute! ~c ["start transaction with consistent snapshot"])
                   ~@body)))))
 

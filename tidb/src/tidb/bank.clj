@@ -8,28 +8,28 @@
             [knossos.op :as op]
             [clojure.core.reducers :as r]
             [clojure.java.jdbc :as j]
-            [tidb.sql :refer :all]
+            [tidb.sql :as c :refer :all]
             [tidb.basic :as basic]
             [clojure.tools.logging :refer :all]))
 
-(defrecord BankClient [node n starting-balance lock-type in-place?]
+(defrecord BankClient [conn n starting-balance]
   client/Client
   (open! [this test node]
-    (assoc this :node node))
+    (assoc this :conn (c/open node)))
 
   (setup! [this test]
-    (j/with-db-connection [c (conn-spec (first (:nodes test)))]
-      (j/execute! c ["create table if not exists accounts
-                     (id     int not null primary key,
-                     balance bigint not null)"])
-      (dotimes [i n]
-        (try
-          (with-txn-retries
-            (j/insert! c :accounts {:id i, :balance starting-balance}))
-          (catch java.sql.SQLIntegrityConstraintViolationException e nil)))))
+    (j/execute! conn ["create table if not exists accounts
+                      (id     int not null primary key,
+                      balance bigint not null)"])
+    (dotimes [i n]
+      (try
+        (with-txn-retries
+          (j/insert! conn :accounts {:id i, :balance starting-balance}))
+        (catch java.sql.SQLIntegrityConstraintViolationException e nil))))
 
   (invoke! [this test op]
-    (with-txn op [c (first (:nodes test))]
+    (info (:read-lock test))
+    (with-txn op [c conn]
       (try
         (case (:f op)
           :read (->> (j/query c [(str "select * from accounts")])
@@ -38,13 +38,14 @@
           :transfer
           (let [{:keys [from to amount]} (:value op)
                 b1 (-> c
-                       (j/query [(str "select * from accounts where id = ?" lock-type) from]
+                       (j/query [(str "select * from accounts where id = ? "
+                                      (:read-lock test)) from]
                                 :row-fn :balance)
                        first
                        (- amount))
                 b2 (-> c
-                       (j/query [(str "select * from accounts where id = ?"
-                                      lock-type)
+                       (j/query [(str "select * from accounts where id = ? "
+                                      (:read-lock test))
                                  to]
                                 :row-fn :balance)
                        first
@@ -54,7 +55,7 @@
                   (neg? b2)
                   (assoc op :type :fail, :value [:negative to b2])
                   true
-                  (if in-place?
+                  (if (:update-in-place test)
                     (do (j/execute! c ["update accounts set balance = balance - ? where id = ?" amount from])
                         (j/execute! c ["update accounts set balance = balance + ? where id = ?" amount to])
                         (assoc op :type :ok))
@@ -64,13 +65,14 @@
 
   (teardown! [_ test])
 
-  (close! [_ test]))
+  (close! [_ test]
+    (c/close! conn)))
 
 (defn bank-client
   "Simulates bank account transfers between n accounts, each starting with
   starting-balance."
-  [n starting-balance lock-type in-place?]
-  (BankClient. nil n starting-balance lock-type in-place?))
+  [n starting-balance]
+  (BankClient. nil n starting-balance))
 
 (defn bank-read
   "Reads the current state of all accounts without any synchronization."
@@ -136,34 +138,35 @@
   [opts]
   (bank-test-base
     (merge {:name   "bank"
-            :client (bank-client 5 10 " FOR UPDATE" false)}
+            :client (bank-client 5 10)}
            opts)))
 
 ; One bank account per table
-(defrecord MultiBankClient [node tbl-created? n starting-balance lock-type in-place?]
+(defrecord MultiBankClient [conn tbl-created? n starting-balance]
   client/Client
-  (setup! [this test node]
+  (open! [this test node]
+    (assoc this :conn (c/open node)))
+
+  (setup! [this test]
     (locking tbl-created?
       (when (compare-and-set! tbl-created? false true)
-        (j/with-db-connection [c (conn-spec (first (:nodes test)))]
-          (dotimes [i n]
+        (dotimes [i n]
+          (Thread/sleep 500)
+          (info "Creating table accounts" i)
+          (j/execute! conn [(str "create table if not exists accounts" i
+                                 "(id     int not null primary key,"
+                                 "balance bigint not null)")])
+          (Thread/sleep 500)
+          (try
             (Thread/sleep 500)
-            (info "Creating table accounts" i)
-            (j/execute! c [(str "create table if not exists accounts" i
-                                "(id     int not null primary key,"
-                                "balance bigint not null)")])
-            (Thread/sleep 500)
-            (try
-              (Thread/sleep 500)
-              (info "Populating account" i)
-              (with-txn-retries
-                (j/insert! c (str "accounts" i) {:id 0, :balance starting-balance}))
-              (catch java.sql.SQLIntegrityConstraintViolationException e nil))))))
-
-    (assoc this :node node))
+            (info "Populating account" i)
+            (with-txn-retries
+              (j/insert! conn (str "accounts" i)
+                         {:id 0, :balance starting-balance}))
+            (catch java.sql.SQLIntegrityConstraintViolationException e nil))))))
 
   (invoke! [this test op]
-    (with-txn op [c (first (:nodes test))]
+    (with-txn op [c conn]
       (try
         (case (:f op)
           :read
@@ -180,12 +183,14 @@
                 to   (str "accounts" to)
                 b1 (-> c
                        (j/query
-                        [(str "select balance from " from lock-type)]
+                        [(str "select balance from " from
+                              " " (:read-lock test))]
                         :row-fn :balance)
                        first
                        (- amount))
                 b2 (-> c
-                       (j/query [(str "select balance from " to lock-type)]
+                       (j/query [(str "select balance from " to
+                                      " " (:read-lock test))]
                                 :row-fn :balance)
                        first
                        (+ amount))]
@@ -194,7 +199,7 @@
                   (neg? b2)
                   (assoc op :type :fail, :error [:negative to b2])
                   true
-                  (if in-place?
+                  (if (:update-in-place test)
                     (do (j/execute! c [(str "update " from " set balance = balance - ? where id = 0") amount])
                         (j/execute! c [(str "update " to " set balance = balance + ? where id = 0") amount])
                         (assoc op :type :ok))
@@ -202,16 +207,19 @@
                         (j/update! c to {:balance b2} ["id = 0"])
                         (assoc op :type :ok)))))))))
 
-  (teardown! [_ test]))
+  (teardown! [_ test])
+
+  (close! [_ test]
+    (c/close! conn)))
 
 (defn multitable-bank-client
-  [n starting-balance lock-type in-place?]
-  (MultiBankClient. nil (atom false) n starting-balance lock-type in-place?))
+  [n starting-balance]
+  (MultiBankClient. nil (atom false) n starting-balance))
 
 (defn multitable-test
   [opts]
   (bank-test-base
    (merge {:name "bank-multitable"
            :model {:n 5 :total 50}
-           :client (multitable-bank-client 5 10 " FOR UPDATE" false)}
+           :client (multitable-bank-client 5 10)}
           opts)))
