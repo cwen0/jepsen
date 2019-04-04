@@ -176,8 +176,11 @@
         (configure!)
 
         (start-pd! test node)
+        (Thread/sleep 10000)
         (start-kv! test node)
+        (Thread/sleep 10000)
         (start-db! test node)
+        (Thread/sleep 10000)
 
         (sql/await-node node)))
 

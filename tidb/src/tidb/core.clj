@@ -21,7 +21,8 @@
    "bank-multitable" bank/multitable-test
    "sets"            sets/test
    "sequential"      sequential/test
-   "register"        register/test})
+   "register"        register/test
+   "register-multi"  register/multi-register-test})
 
 (def oses
   "Supported operating systems"
