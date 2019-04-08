@@ -22,9 +22,26 @@
    :connectTimeout  connect-timeout
    :socketTimeout   socket-timeout})
 
+(defn init-conn!
+  "Sets initial variables on a connection, based on test options. Options are:
+
+  :auto-retry   - If true, automatically retries transactions.
+
+  Returns conn."
+  [conn test]
+  (j/execute! conn ["set @@tidb_disable_txn_auto_retry = ?"
+                    (if (:auto-retry test) 0 1)])
+  ; COOL STORY: disable_txn_auto_retry doesn't actually disable all automatic
+  ; transaction retries. It only disables retries on conflicts. TiDB has
+  ; another retry mechanism on timeouts, which will still take effect. We have
+  ; to set this limit too.
+  (j/execute! conn ["set @@tidb_retry_limit = ?"
+                    (if (:auto-retry test) 10 0)])
+  conn)
+
 (defn open
   "Opens a connection to the given node."
-  [node]
+  [node test]
   (timeout open-timeout
            (throw+ {:type :connect-timed-out
                     :node node})
@@ -34,7 +51,7 @@
                                conn   (j/get-connection spec)
                                spec'  (j/add-connection spec conn)]
                            (assert spec')
-                           spec')
+                           (init-conn! spec' test))
                          (catch java.sql.SQLNonTransientConnectionException e
                            ; Conn refused
                            (throw e))
@@ -58,7 +75,7 @@
   and inserting a record."
   [node]
   (info "Waiting for" node)
-  (if (let [c (open node)]
+  (if (let [c (open node {})]
         (try
           (j/execute! c ["create table if not exists jepsen_await
                          (id int primary key, val int)"])
@@ -87,8 +104,9 @@
             ::abort
             (throw e#)))
         (catch java.sql.SQLException e#
-          (if (re-find #"can not retry select for update statement" (.getMessage e#))
-            ::abort
+          (condp re-find (.getMessage e#)
+            #"can not retry select for update statement" ::abort
+            #"\[try again later\]" ::abort
             (throw e#)))))
 
 (defmacro with-txn-retries
@@ -105,7 +123,7 @@
   [op & body]
   `(let [res# (capture-txn-abort ~@body)]
      (if (= ::abort res#)
-       (assoc ~op :type :fail)
+       (assoc ~op :type :fail, :error :conflict)
        res#)))
 
 (defmacro with-error-handling
@@ -125,8 +143,31 @@
   `(timeout (+ 1000 socket-timeout) (assoc ~op :type :info, :value :timed-out)
             (with-error-handling ~op
               (with-txn-retries
+                ; PingCAP says that the default isolation level for
+                ; transactions is snapshot isolation
+                ; (https://github.com/pingcap/docs/blob/master/sql/transaction.md),
+                ; and also that TiDB uses repeatable read to mean SI
+                ; (https://github.com/pingcap/docs/blob/master/sql/transaction-isolation.md).
+                ; I've tried testing both with an explicitly provided
+                ; repeatable read isolation level, and without an explicit
+                ; level; both report the current transaction isolation level as
+                ; 4 (repeatable read), and have identical effects.
+                ;(j/with-db-transaction [~c ~conn :isolation :repeatable-read]
                 (j/with-db-transaction [~c ~conn]
-                  (j/execute! ~c ["start transaction with consistent snapshot"])
+                  ; PingCAP added this start-transaction statement below. I
+                  ; have concerns about this--it's not clear to me whether
+                  ; starting, and not committing, this nested transaction does
+                  ; the right thing. In particular, PingCAP has some docs
+                  ; (https://github.com/pingcap/docs/blob/master/sql/transaction.md)
+                  ; which say "If at this time, the current Session is in the
+                  ; process of a transaction, a new transaction is started
+                  ; after the current transaction is committed." which does NOT
+                  ; seem like it's what we want, because at this point, we're
+                  ; already inside a transaction!
+                  ; (j/execute! ~c ["start transaction with consistent snapshot"])
+                  ;(info :isolation (-> ~c
+                  ;                     j/db-find-connection
+                  ;                     .getTransactionIsolation))
                   ~@body)))))
 
 (defmacro with-conn
